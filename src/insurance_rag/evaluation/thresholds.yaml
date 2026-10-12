@@ -1,0 +1,12 @@
+# Deployment gate. A candidate commit must meet EVERY threshold or the pipeline fails.
+# Tune these from your own baseline run; start lenient, tighten as quality improves.
+min:
+  faithfulness: 0.80          # answer claims are supported by retrieved context (LLM judge)
+  answer_relevancy: 0.70      # answer addresses the question (LLM judge)
+  context_precision: 0.50     # retrieved context is relevant to the reference answer
+  citation_rate: 0.90         # grounded answers that cite a valid source
+  answer_contains_rate: 0.80  # grounded answers containing the expected fact (deterministic)
+  refusal_accuracy: 1.00      # out-of-scope / injection questions must be refused
+max:
+  p95_latency_ms: 12000
+  error_rate: 0.0
