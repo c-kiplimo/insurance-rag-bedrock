@@ -1,0 +1,185 @@
+name: ci-cd
+
+# Pull request: lint, types, unit tests, terraform validate, docker build, LLM quality gate.
+# Push to main: the same gates, then publish prompt version + image and deploy.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+jobs:
+  check:
+    name: lint / types / unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -e ".[dev,ingestion,observability]"
+      - run: ruff check .
+      - run: ruff format --check .
+      - run: mypy src
+      - run: pytest
+
+  terraform:
+    name: terraform fmt / validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - run: terraform fmt -check -recursive
+        working-directory: infra/terraform
+      - run: terraform init -backend=false -input=false
+        working-directory: infra/terraform
+      - run: terraform validate
+        working-directory: infra/terraform
+
+  docker:
+    name: docker build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          tags: insurance-rag:ci
+
+  # The automated quality gate: replaces manual prompt review. Runs the real pipeline
+  # (Bedrock via OIDC) against a throwaway OpenSearch + Redis on the runner, scores the
+  # answers (Ragas, Bedrock as judge), stores the run in DynamoDB keyed by commit SHA, and
+  # exits non-zero if any threshold in evaluation/thresholds.yaml is missed.
+  eval:
+    name: LLM quality gate
+    needs: [check]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    if: vars.AWS_CI_ROLE_ARN != ''   # skipped on forks / before AWS is configured
+    permissions:
+      id-token: write
+      contents: read
+    services:
+      opensearch:
+        image: opensearchproject/opensearch:2.17.1
+        ports: ["9200:9200"]
+        env:
+          discovery.type: single-node
+          DISABLE_SECURITY_PLUGIN: "true"
+          DISABLE_INSTALL_DEMO_CONFIG: "true"
+          OPENSEARCH_JAVA_OPTS: "-Xms1g -Xmx1g"
+        options: >-
+          --health-cmd "curl -fs http://localhost:9200/_cluster/health"
+          --health-interval 10s --health-timeout 5s --health-retries 30
+      redis:
+        image: redis/redis-stack-server:7.4.0-v1
+        ports: ["6379:6379"]
+    env:
+      RAG_OPENSEARCH_ENDPOINT: http://localhost:9200
+      RAG_REDIS_URL: redis://localhost:6379
+      RAG_ENV: local
+      RAG_AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+      RAG_RERANK_REGION: ${{ vars.RAG_RERANK_REGION || 'us-west-2' }}
+      RAG_LLM_MODEL_ID: ${{ vars.RAG_LLM_MODEL_ID || 'us.amazon.nova-lite-v1:0' }}
+      RAG_CACHE_MODE: "off"
+      RAG_EVAL_TABLE: ${{ vars.RAG_EVAL_TABLE || 'insurance-rag-eval-results' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_CI_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+      - run: pip install -e ".[ingestion,eval]"
+      - uses: actions/cache@v4
+        with:
+          path: data/raw
+          key: raw-${{ hashFiles('src/insurance_rag/ingestion/sources.yaml') }}
+      - run: python -m insurance_rag init-index --recreate
+      - run: python -m insurance_rag download
+      - run: python -m insurance_rag generate-claims --count 10
+      - run: python -m insurance_rag ingest --redactor regex
+      - name: Evaluate and gate
+        run: python -m insurance_rag.evaluation.run --commit "$GITHUB_SHA" --store dynamodb --scorer ragas
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: eval-report
+          path: eval_report.json
+
+  deploy:
+    name: publish prompt + image, deploy
+    needs: [check, terraform, docker, eval]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push' && vars.AWS_CI_ROLE_ARN != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: production        # configure required reviewers on this environment
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      TF_VARS_JSON: ${{ vars.TF_VARS_JSON }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_CI_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+      - uses: aws-actions/amazon-ecr-login@v2
+        id: ecr
+
+      # 1. Prompt: Git stays the source of truth; Bedrock gets an immutable version.
+      - run: pip install -e .
+      - id: prompt
+        run: python -m insurance_rag.llmops_prompt_sync --git-sha "$GITHUB_SHA"
+
+      # 2. Image: immutable tag = commit SHA.
+      - name: Build and push image
+        env:
+          REPO: ${{ steps.ecr.outputs.registry }}/insurance-rag
+        run: |
+          docker build -t "$REPO:$GITHUB_SHA" .
+          docker build --target ingest -t "$REPO:$GITHUB_SHA-ingest" .
+          docker push "$REPO:$GITHUB_SHA"
+          docker push "$REPO:$GITHUB_SHA-ingest"
+
+      # 3. Infrastructure + service rollout (ECS circuit breaker rolls back a bad deploy).
+      - uses: hashicorp/setup-terraform@v3
+      - name: Terraform apply
+        working-directory: infra/terraform
+        env:
+          PROMPT_ID: ${{ steps.prompt.outputs.prompt_id }}
+          PROMPT_VERSION: ${{ steps.prompt.outputs.prompt_version }}
+        run: |
+          printf '%s' "$TF_VARS_JSON" > ci.auto.tfvars.json
+          terraform init -input=false
+          terraform apply -input=false -auto-approve \
+            -var "image_tag=$GITHUB_SHA" \
+            -var "prompt_id=$PROMPT_ID" \
+            -var "prompt_version=$PROMPT_VERSION"
+      - name: Wait for stable service
+        run: |
+          aws ecs wait services-stable \
+            --cluster "insurance-rag-${{ vars.TF_ENVIRONMENT || 'staging' }}" --services api
