@@ -1,0 +1,54 @@
+# Local dependencies: OpenSearch (hybrid search) and Redis Stack (vector-capable cache).
+# Bedrock is NOT emulated: it uses your real AWS credentials (embeddings cost cents).
+#
+#   docker compose up -d opensearch redis       # dependencies only (run the API on your host)
+#   docker compose --profile api up --build     # also run the API container
+services:
+  opensearch:
+    image: opensearchproject/opensearch:2.17.1
+    environment:
+      discovery.type: single-node
+      DISABLE_SECURITY_PLUGIN: "true"      # local only. Never do this outside your laptop.
+      DISABLE_INSTALL_DEMO_CONFIG: "true"
+      OPENSEARCH_JAVA_OPTS: "-Xms1g -Xmx1g"
+    ulimits:
+      memlock: { soft: -1, hard: -1 }
+    ports: ["9200:9200"]
+    volumes: ["os-data:/usr/share/opensearch/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:9200/_cluster/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis/redis-stack-server:7.4.0-v1   # includes the search module (vector KNN)
+    ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  api:
+    profiles: ["api"]
+    build: .
+    ports: ["8080:8080"]
+    depends_on:
+      opensearch: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    environment:
+      RAG_ENV: local
+      RAG_OPENSEARCH_ENDPOINT: http://opensearch:9200
+      RAG_REDIS_URL: redis://redis:6379
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      RAG_AWS_REGION: ${AWS_REGION:-us-east-1}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+      AWS_PROFILE: ${AWS_PROFILE:-}
+    volumes:
+      - ${HOME}/.aws:/home/app/.aws:ro
+
+volumes:
+  os-data:
