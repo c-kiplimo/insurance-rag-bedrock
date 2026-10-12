@@ -1,0 +1,17 @@
+# Free, public insurance documents used to feed the system when you have no real data.
+# All are U.S. federal government publications (FEMA / NFIP), which are public domain.
+# Check each URL still resolves before a big run; agencies occasionally move files.
+# Drop your own PDFs into data/raw/ and they are ingested too.
+sources:
+  - id: nfip-dwelling-sfip-2015
+    title: NFIP Dwelling Form - Standard Flood Insurance Policy (F-122)
+    url: https://www.fema.gov/sites/default/files/2020-05/F-122_Dwelling_SFIP_102015.pdf
+    doc_type: policy_contract
+  - id: nfip-flood-insurance-manual-appendices-2021
+    title: NFIP Flood Insurance Manual - Appendices (Oct 2021)
+    url: https://www.fema.gov/sites/default/files/documents/fema_nfip-flood-insurance-manual-appendices_oct2021.pdf
+    doc_type: underwriting_guideline
+  - id: nfip-summary-of-coverage
+    title: NFIP Summary of Coverage
+    url: https://mdfloodmaps.net/pdfs/Insure_Your_Risk/Summary_of_Coverage.pdf
+    doc_type: coverage_summary
